@@ -7,6 +7,7 @@ class Service(StrEnum):
     JELLYFIN = auto()
     EMBY = auto()
     PLEX = auto()
+    SILO = auto()
     SEERR = auto()
     TAUTULLI = auto()
     TRACEARR = auto()

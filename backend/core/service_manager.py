@@ -14,6 +14,7 @@ from backend.services.jellyfin import JellyfinService
 from backend.services.plex import PlexService
 from backend.services.radarr import RadarrClient
 from backend.services.seerr import SeerrClient
+from backend.services.silo import SiloService
 from backend.services.sonarr import SonarrClient
 from backend.services.tautulli import TautulliClient
 from backend.services.tracearr import TracearrClient
@@ -255,6 +256,8 @@ class ServiceManager:
                 return await EmbyService.test_service(url, api_key), ""
             elif service_type is Service.PLEX:
                 return await PlexService.test_service(url, api_key), ""
+            elif service_type is Service.SILO:
+                return await SiloService.test_service(url, api_key), ""
             elif service_type is Service.RADARR:
                 return await RadarrClient.test_service(url, api_key), ""
             elif service_type is Service.SONARR:
