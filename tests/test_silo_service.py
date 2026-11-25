@@ -166,16 +166,48 @@ HISTORY = [
 ]
 
 
+ACCOUNTS = [{"id": "1", "username": "anna"}, {"id": "2", "username": "bob"}]
+PROFILES = {
+    "1": [{"id": "p-anna", "name": "anna"}, {"id": "p-kids", "name": "Kids"}],
+    "2": [{"id": "p-bob", "name": "Bob"}],
+}
+# completed progress: what each profile watched, including manual marks
+PROGRESS = {
+    # newer than anna's last play of The Matrix
+    ("1", "p-anna"): [
+        {
+            "media_item_id": "movie-tmdb-603",
+            "completed": True,
+            "updated_at": "2026-03-20T10:00:00Z",
+        },
+    ],
+    # Kids marked an episode watched without ever playing it
+    ("1", "p-kids"): [
+        {
+            "media_item_id": "ep-2-1",
+            "completed": True,
+            "updated_at": "2026-03-15T10:00:00Z",
+        },
+    ],
+}
+
+
 class FakeSilo:
     """Routes SiloService._make_request calls, paging two rows at a time."""
 
     page_size = 2
 
     def __init__(
-        self, *, sessions: list[dict] | None = None, fail_history: bool = False
+        self,
+        *,
+        sessions: list[dict] | None = None,
+        fail_history: bool = False,
+        profile_progress: bool = False,
     ):
         self.sessions = sessions or []
         self.fail_history = fail_history
+        # whether the server has listAdminUserProfileProgress
+        self.profile_progress = profile_progress
         self.calls: list[tuple[str, list[tuple[str, Any]]]] = []
 
     def rows(self, endpoint: str, params: list[tuple[str, Any]]) -> list[dict]:
@@ -188,6 +220,14 @@ class FakeSilo:
             if self.fail_history:
                 raise ConnectionError("history down")
             return HISTORY
+        if endpoint == "admin/users":
+            return ACCOUNTS
+        if endpoint.startswith("admin/users/") and endpoint.endswith("/profiles"):
+            return PROFILES[endpoint.split("/")[2]]
+        if endpoint.endswith("/progress"):
+            _, _, account, _, profile, _ = endpoint.split("/")
+            assert p.get("status") == "completed"
+            return PROGRESS.get((account, profile), [])
         if endpoint == "admin/catalog/items":
             rows = [r for r in CATALOG if r["type"] == p.get("type")]
             if "library_id" in p:
@@ -203,6 +243,8 @@ class FakeSilo:
         self.calls.append((endpoint, params))
         if endpoint in {"system/info", "admin/catalog/capabilities"}:
             return {}
+        if endpoint == "admin/users/capabilities":
+            return {"available": True, "profile_progress": self.profile_progress}
         rows = self.rows(endpoint, params)
         p = dict(params)
         start = int(p.get("cursor", 0))
@@ -402,3 +444,24 @@ def test_scan_item_path_targets_owning_library(monkeypatch):
             {"library_id": "2", "path": "/media/tv/Show/Season 1"},
         )
     ]
+
+
+def test_watched_snapshots_add_marked_watched_titles_when_supported():
+    snapshots = run_with(
+        FakeSilo(profile_progress=True), lambda c: c.get_watched_user_snapshots()
+    )
+    by_key = {(s.media_type, s.watch_user_key, s.source_item_id): s for s in snapshots}
+    anna = by_key[(MediaType.MOVIE, "anna", "movie-tmdb-603")]
+    # the later mark moves last-watched forward but keeps the play count
+    assert anna.last_watched_at == datetime(2026, 3, 20, 10, tzinfo=UTC)
+    assert anna.play_count == 2
+    kids = by_key[(MediaType.SERIES, "anna (Kids)", "ep-2-1")]
+    assert (kids.tmdb_id, kids.season_number, kids.episode_number) == (1399, 2, 1)
+    assert kids.play_count is None  # marked, never played
+    assert len(snapshots) == 4
+
+
+def test_watched_snapshots_skip_profile_progress_on_older_servers():
+    fake = FakeSilo(profile_progress=False)
+    run_with(fake, lambda c: c.get_watched_user_snapshots())
+    assert not any(endpoint.endswith("/progress") for endpoint, _ in fake.calls)

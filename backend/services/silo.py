@@ -11,6 +11,9 @@ administrator's ``sa_`` API key:
   ``include_file_paths``, its path on the Silo host)
 * watch data: ``GET /api/v2/admin/playback-history`` (finalized plays across
   every account and profile)
+* marked-watched titles, when the server offers it:
+  ``GET /api/v2/admin/users/{id}/profiles/{profile_id}/progress``
+  (detected through ``profile_progress`` in the account capabilities)
 * live playback: ``GET /api/v2/admin/sessions``
 * rescans: ``POST /api/v2/scan``
 
@@ -633,14 +636,55 @@ class SiloService:
             )
         return seasons
 
-    async def get_watched_user_snapshots(self) -> list[MediaWatchSnapshot]:
-        """Latest completed play per viewer for every movie and episode.
+    async def _supports_profile_progress(self) -> bool:
+        """Whether the server lets an administrator read each profile's progress.
 
-        Only real plays are visible to an administrator: Silo keeps titles a
-        viewer *marked* watched in profile-scoped state that the admin API
-        does not expose.
+        ``listAdminUserProfileProgress`` is newer than the rest of the admin
+        API; servers without it simply lack the capability flag.
         """
-        latest: dict[str, dict[str, tuple[datetime, int]]] = defaultdict(dict)
+        try:
+            caps = await self._make_request("admin/users/capabilities")
+        except Exception as exc:
+            LOG.debug(f"Silo account capabilities unavailable: {exc}")
+            return False
+        return caps.get("profile_progress") is True
+
+    async def _viewers(self) -> AsyncIterator[tuple[str, str, str]]:
+        """Yield ``(account id, profile id, watch user key)`` for every profile."""
+        async for account in self._paginate("admin/users"):
+            account_id = str(account.get("id") or "")
+            if not account_id:
+                continue
+            async for profile in self._paginate(f"admin/users/{account_id}/profiles"):
+                profile_id = str(profile.get("id") or "")
+                viewer = watch_user_key(account.get("username"), profile.get("name"))
+                if profile_id and viewer:
+                    yield account_id, profile_id, viewer
+
+    async def _marked_watched(self) -> AsyncIterator[tuple[str, str, datetime]]:
+        """Yield ``(content id, watch user key, when)`` for completed progress.
+
+        Completed progress covers titles a profile played to the end *and*
+        titles it marked watched without playing, which playback history
+        never records.
+        """
+        async for account_id, profile_id, viewer in self._viewers():
+            endpoint = f"admin/users/{account_id}/profiles/{profile_id}/progress"
+            async for row in self._paginate(endpoint, [("status", "completed")]):
+                item_id = str(row.get("media_item_id") or "")
+                when = _parse_datetime(row.get("updated_at"))
+                if item_id and when is not None:
+                    yield item_id, viewer, when
+
+    async def get_watched_user_snapshots(self) -> list[MediaWatchSnapshot]:
+        """Latest watch per viewer for every movie and episode.
+
+        Completed plays come from playback history. On servers that let an
+        administrator read each profile's progress, titles a viewer marked
+        watched are added too (with an unknown play count when no play
+        backs them); older servers only expose real plays.
+        """
+        latest: dict[str, dict[str, tuple[datetime, int | None]]] = defaultdict(dict)
         async for row in self._completed_plays():
             item_id = str(row.get("media_item_id") or "")
             viewer = watch_user_key(row.get("username"), row.get("profile_name"))
@@ -648,9 +692,16 @@ class SiloService:
             if not item_id or not viewer or ended_at is None:
                 continue
             previous = latest[item_id].get(viewer)
-            count = (previous[1] if previous else 0) + 1
+            count = ((previous[1] or 0) if previous else 0) + 1
             newest = max(ended_at, previous[0]) if previous else ended_at
             latest[item_id][viewer] = (newest, count)
+        if await self._supports_profile_progress():
+            async for item_id, viewer, when in self._marked_watched():
+                previous = latest[item_id].get(viewer)
+                if previous is None:
+                    latest[item_id][viewer] = (when, None)
+                elif when > previous[0]:
+                    latest[item_id][viewer] = (when, previous[1])
         if not latest:
             return []
 
